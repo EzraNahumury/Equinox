@@ -20,12 +20,6 @@ interface CreateOrderParams {
   collateralCoinId?: string;
 }
 
-interface DepositToVaultParams {
-  vaultId: string;
-  amount: number;
-  coinObjectId: string;
-}
-
 interface CreateBorrowParams {
   collateralCoinId: string;
   borrowAsset: string;
@@ -393,26 +387,6 @@ export function buildCreateOrderTx(params: CreateOrderParams): Transaction {
   return tx;
 }
 
-export function buildDepositToVaultTx(params: DepositToVaultParams): Transaction {
-  const tx = new Transaction();
-  const packageId = getPackageId();
-
-  if (!packageId) {
-    throw new Error("Package ID not configured");
-  }
-
-  // Using registry module for vault deposits
-  tx.moveCall({
-    target: `${packageId}::registry::deposit_to_vault`,
-    arguments: [
-      tx.object(params.vaultId),
-      tx.object(params.coinObjectId),
-    ],
-  });
-
-  return tx;
-}
-
 export function buildCreateBorrowTx(params: CreateBorrowParams): Transaction {
   return buildBorrowOrderTx({
     asset: params.borrowAsset,
@@ -545,32 +519,6 @@ export function buildLiquidateLoanTx(
   return tx;
 }
 
-// Build a transaction to claim rewards from vesting
-export function buildClaimVestingRewardsTx(vestingPositionId: string): Transaction {
-  const tx = new Transaction();
-  const packageId = getPackageId();
-  const vestingVaultId = getVestingVaultId();
-
-  if (!packageId) {
-    throw new Error("Package ID not configured");
-  }
-
-  if (!vestingVaultId) {
-    throw new Error("Vesting vault ID not configured");
-  }
-
-  tx.moveCall({
-    target: `${packageId}::vesting::claim_rewards`,
-    arguments: [
-      tx.object(vestingVaultId),
-      tx.object(vestingPositionId),
-      tx.object("0x6"), // Clock object
-    ],
-  });
-
-  return tx;
-}
-
 // Build a transaction to mint mock tokens (Faucet)
 export function buildMintTokenTx(asset: string, amount: number): Transaction {
   const tx = new Transaction();
@@ -660,16 +608,52 @@ export function buildCancelBorrowOrderTx(orderId: string, asset: string, collate
   return tx;
 }
 
-// Match orders (for demo/testing)
-export function buildMatchOrdersTx(
-  lendOrderId: string,
-  borrowOrderId: string,
-  asset: string,
-  collateral: string = "SUI"
-): Transaction {
+// Match orders via the deterministic on-chain entry that does not require a Nautilus proof.
+// Matches Move sig: match_best_offer<A,C>(market, lend_id, borrow_id, clock, ctx)
+export function buildMatchBestOfferTx(params: {
+  lendOrderId: string;
+  borrowOrderId: string;
+  asset: string;
+  collateral: string;
+}): Transaction {
   const tx = new Transaction();
   const packageId = getPackageId();
-  const marketId = getMarketId(asset, collateral);
+  const marketId = getMarketId(params.asset, params.collateral);
+
+  if (!packageId) throw new Error("Package ID not configured");
+  if (!marketId) throw new Error("Market ID not configured");
+
+  tx.moveCall({
+    target: `${packageId}::market::match_best_offer`,
+    typeArguments: [
+      getAssetCoinType(params.asset, packageId),
+      getAssetCoinType(params.collateral, packageId),
+    ],
+    arguments: [
+      tx.object(marketId),
+      tx.pure.id(params.lendOrderId),
+      tx.pure.id(params.borrowOrderId),
+      tx.object("0x6"),
+    ],
+  });
+
+  return tx;
+}
+
+// Match orders via Nautilus enclave-signed fairness proof.
+// Matches Move sig: match_orders<A,C>(market, enclave, lend_id, borrow_id, score, proof, clock, ctx)
+export function buildMatchOrdersTx(params: {
+  lendOrderId: string;
+  borrowOrderId: string;
+  asset: string;
+  collateral: string;
+  enclaveId: string;
+  fairnessScore: number;
+  fairnessProof: Uint8Array;
+}): Transaction {
+  const tx = new Transaction();
+  const packageId = getPackageId();
+  const marketId = getMarketId(params.asset, params.collateral);
 
   if (!packageId) throw new Error("Package ID not configured");
   if (!marketId) throw new Error("Market ID not configured");
@@ -677,17 +661,113 @@ export function buildMatchOrdersTx(
   tx.moveCall({
     target: `${packageId}::market::match_orders`,
     typeArguments: [
-      getAssetCoinType(asset, packageId),
-      getAssetCoinType(collateral, packageId),
+      getAssetCoinType(params.asset, packageId),
+      getAssetCoinType(params.collateral, packageId),
     ],
     arguments: [
       tx.object(marketId),
-      tx.pure.address(lendOrderId), // Use address for ID type
-      tx.pure.address(borrowOrderId),
-      tx.object("0x6"), // Clock object
+      tx.object(params.enclaveId),
+      tx.pure.id(params.lendOrderId),
+      tx.pure.id(params.borrowOrderId),
+      tx.pure.u64(params.fairnessScore),
+      tx.pure.vector("u8", Array.from(params.fairnessProof)),
+      tx.object("0x6"),
     ],
   });
 
+  return tx;
+}
+
+// ============== AGGREGATOR VAULT ==============
+
+export function buildVaultDepositTx(params: {
+  vaultId: string;
+  asset: string;
+  amount: number;
+  coinObjectId?: string;
+}): Transaction {
+  const tx = new Transaction();
+  const packageId = getPackageId();
+  if (!packageId) throw new Error("Package ID not configured");
+  if (!params.vaultId) throw new Error("Vault ID not configured");
+
+  const amountSmallest = toSmallestUnit(params.amount, params.asset);
+
+  let coinArg;
+  if (params.asset === "SUI") {
+    [coinArg] = tx.splitCoins(tx.gas, [amountSmallest]);
+  } else {
+    if (!params.coinObjectId) {
+      throw new Error(`coinObjectId required for non-SUI vault deposits (${params.asset})`);
+    }
+    [coinArg] = tx.splitCoins(tx.object(params.coinObjectId), [amountSmallest]);
+  }
+
+  tx.moveCall({
+    target: `${packageId}::vault::deposit`,
+    typeArguments: [getAssetCoinType(params.asset, packageId)],
+    arguments: [tx.object(params.vaultId), coinArg],
+  });
+  return tx;
+}
+
+export function buildVaultWithdrawTx(params: {
+  vaultId: string;
+  asset: string;
+  amount: number;
+}): Transaction {
+  const tx = new Transaction();
+  const packageId = getPackageId();
+  if (!packageId) throw new Error("Package ID not configured");
+  const amountSmallest = toSmallestUnit(params.amount, params.asset);
+  tx.moveCall({
+    target: `${packageId}::vault::withdraw`,
+    typeArguments: [getAssetCoinType(params.asset, packageId)],
+    arguments: [tx.object(params.vaultId), tx.pure.u64(amountSmallest)],
+  });
+  return tx;
+}
+
+/**
+ * Submit one signed allocation leg produced by `signAllocationPlan`.
+ *
+ * Each leg places one lend order on the target market. Submitting legs individually keeps
+ * partial failures recoverable.
+ */
+export function buildExecuteAllocationLegTx(params: {
+  vaultId: string;
+  enclaveId: string;
+  marketId: string;
+  asset: string;
+  collateral: string;
+  nonce: number;
+  amount: number;       // raw smallest-unit amount
+  rateBps: number;
+  durationMs: number;
+  signature: Uint8Array;
+}): Transaction {
+  const tx = new Transaction();
+  const packageId = getPackageId();
+  if (!packageId) throw new Error("Package ID not configured");
+
+  tx.moveCall({
+    target: `${packageId}::vault::execute_allocation_leg`,
+    typeArguments: [
+      getAssetCoinType(params.asset, packageId),
+      getAssetCoinType(params.collateral, packageId),
+    ],
+    arguments: [
+      tx.object(params.vaultId),
+      tx.object(params.enclaveId),
+      tx.object(params.marketId),
+      tx.pure.u64(params.nonce),
+      tx.pure.u64(params.amount),
+      tx.pure.u64(params.rateBps),
+      tx.pure.u64(params.durationMs),
+      tx.pure.vector("u8", Array.from(params.signature)),
+      tx.object("0x6"),
+    ],
+  });
   return tx;
 }
 

@@ -27,6 +27,9 @@ export interface EnvConfig {
     aiMatching: boolean;
     vestingVault: boolean;
   };
+  matching: {
+    minFairnessScore: number;
+  };
 }
 
 export const env: EnvConfig = {
@@ -56,6 +59,9 @@ export const env: EnvConfig = {
     zkOrders: process.env.NEXT_PUBLIC_ENABLE_ZK_ORDERS === "true",
     aiMatching: process.env.NEXT_PUBLIC_ENABLE_AI_MATCHING === "true",
     vestingVault: process.env.NEXT_PUBLIC_ENABLE_VESTING_VAULT === "true",
+  },
+  matching: {
+    minFairnessScore: Number(process.env.NEXT_PUBLIC_MIN_FAIRNESS_SCORE ?? "0"),
   },
 };
 

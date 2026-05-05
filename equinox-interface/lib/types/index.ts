@@ -9,6 +9,7 @@ export interface Order {
   creator?: string;
   type: OrderType;
   asset: string;
+  collateralAsset?: string;
   amount: number;
   interestRate: number;
   ltv: number;

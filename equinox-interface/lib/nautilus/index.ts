@@ -210,6 +210,14 @@ class SimulatedNautilusEnclave {
   getPublicKey(): Uint8Array {
     return this.keypair.getPublicKey().toSuiBytes();
   }
+
+  /**
+   * Sign an arbitrary message under the enclave's key. Used by the vault aggregator path
+   * where each allocation leg has its own signed payload.
+   */
+  async signRaw(message: Uint8Array): Promise<Uint8Array> {
+    return this.keypair.sign(message);
+  }
 }
 
 // Helper function to convert hex string to bytes
@@ -224,6 +232,112 @@ function hexToBytes(hex: string): Uint8Array {
 // Helper function to convert bytes to hex string
 export function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Vault allocation request — given a deposit amount, the enclave proposes how to split it
+ * across one or more markets to chase yield. In production the recommendation comes from a
+ * Nautilus-hosted model; here we return a deterministic-but-tunable plan.
+ */
+export interface AllocationLegRequest {
+  marketId: string;
+  weight: number;       // fraction of the deposit, 0..1
+  rateBps: number;
+  durationMs: number;
+}
+
+export interface AllocationPlanRequest {
+  vaultId: string;
+  amount: number;       // raw smallest-unit amount
+  legs: AllocationLegRequest[];
+}
+
+export interface SignedAllocationLeg {
+  marketId: string;
+  amount: number;       // raw smallest-unit amount
+  rateBps: number;
+  durationMs: number;
+  nonce: number;
+  signature: Uint8Array;
+}
+
+/**
+ * Sign an allocation plan using the enclave keypair so the on-chain vault can verify each
+ * leg before routing capital. Each leg gets its own signature so the keeper can submit
+ * legs independently if some markets are temporarily paused.
+ */
+export async function signAllocationPlan(
+  request: AllocationPlanRequest,
+): Promise<SignedAllocationLeg[]> {
+  const enclave = getEnclave();
+  const nonce = Date.now();
+  const totalWeight = request.legs.reduce((acc, leg) => acc + leg.weight, 0);
+  if (totalWeight <= 0) throw new Error("Allocation plan has zero total weight");
+
+  const out: SignedAllocationLeg[] = [];
+  let allocated = 0;
+  for (let i = 0; i < request.legs.length; i++) {
+    const leg = request.legs[i];
+    // Last leg absorbs rounding so the sum exactly equals request.amount.
+    const isLast = i === request.legs.length - 1;
+    const legAmount = isLast
+      ? request.amount - allocated
+      : Math.floor(request.amount * (leg.weight / totalWeight));
+    allocated += legAmount;
+
+    const message = buildAllocationLegMessage({
+      vaultId: request.vaultId,
+      nonce,
+      marketId: leg.marketId,
+      amount: legAmount,
+      rateBps: leg.rateBps,
+      durationMs: leg.durationMs,
+    });
+    const signature = await enclave.signRaw(message);
+
+    out.push({
+      marketId: leg.marketId,
+      amount: legAmount,
+      rateBps: leg.rateBps,
+      durationMs: leg.durationMs,
+      nonce,
+      signature,
+    });
+  }
+  return out;
+}
+
+function buildAllocationLegMessage(args: {
+  vaultId: string;
+  nonce: number;
+  marketId: string;
+  amount: number;
+  rateBps: number;
+  durationMs: number;
+}): Uint8Array {
+  const vaultBytes = fromHex(normalizeSuiAddress(args.vaultId));
+  const marketBytes = fromHex(normalizeSuiAddress(args.marketId));
+  const u64 = (n: number) => {
+    const buf = new Uint8Array(8);
+    new DataView(buf.buffer).setBigUint64(0, BigInt(n), true);
+    return buf;
+  };
+  const parts = [
+    vaultBytes,
+    u64(args.nonce),
+    marketBytes,
+    u64(args.amount),
+    u64(args.rateBps),
+    u64(args.durationMs),
+  ];
+  const total = parts.reduce((acc, p) => acc + p.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
 }
 
 // Singleton instance

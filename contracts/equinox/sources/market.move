@@ -16,6 +16,7 @@ module equinox::market {
     
     use equinox::loan::{Self};
     use equinox::registry::{Self, Registry};
+    use equinox::vesting::{Self, VestingPosition};
 
     // ============== ERROR CODES ==============
     const EOrderNotFound: u64 = 0;
@@ -31,6 +32,9 @@ module equinox::market {
     const EAssetNotSupported: u64 = 10;
     const EExceedsMaxLTV: u64 = 11;
     const EMarketPaused: u64 = 12;
+    const EUnauthorized: u64 = 13;
+    const EInvalidPrice: u64 = 14;
+    const EInvalidVestingPosition: u64 = 15;
 
     // ============== STRUCTS ==============
 
@@ -317,6 +321,12 @@ module equinox::market {
         transfer::share_object(enclave);
     }
 
+    /// Public accessor for the enclave's Ed25519 public key. Other modules (e.g. the
+    /// aggregator vault) need this to verify signatures produced by the same enclave.
+    public fun enclave_public_key(enclave: &RegisteredEnclave): vector<u8> {
+        enclave.public_key
+    }
+
     /// Link enclave to market
     public entry fun set_market_enclave<Asset, Collateral>(
         market: &mut Market<Asset, Collateral>,
@@ -404,11 +414,14 @@ module equinox::market {
         ctx: &mut TxContext
     ): ID {
         assert!(market.is_active, EMarketPaused);
-        
+        assert!(collateral_price > 0 && asset_price > 0, EInvalidPrice);
+
         // Validate LTV
         let collateral_amount = coin::value(&collateral);
+        assert!(collateral_amount > 0, EInsufficientCollateral);
         let max_ltv = registry::get_max_ltv<Collateral>(registry);
         let collateral_value = (collateral_amount as u128) * (collateral_price as u128);
+        assert!(collateral_value > 0, EInsufficientCollateral);
         let borrow_value = (amount_requested as u128) * (asset_price as u128);
         let current_ltv = borrow_value * 10000 / collateral_value;
         assert!(current_ltv <= (max_ltv as u128), EExceedsMaxLTV);
@@ -492,17 +505,26 @@ module equinox::market {
     }
 
     /// Place Borrow Order with Vesting Collateral
+    /// Requires reference to caller's VestingPosition to prove ownership and prevent
+    /// free fairness boosts via fake position IDs.
     public fun place_vested_borrow_order<Asset, Collateral>(
         market: &mut Market<Asset, Collateral>,
+        vesting_position: &VestingPosition,
         collateral: Coin<Collateral>,
         amount_requested: u64,
         interest_rate_bps: u64,
         duration_ms: u64,
-        vesting_position_id: ID,
         clock: &Clock,
         ctx: &mut TxContext
     ): ID {
         assert!(market.is_active, EMarketPaused);
+
+        // Authenticate vesting position ownership and unused state
+        let (_, _, _, vp_owner, vp_collateralized) = vesting::get_position_info(vesting_position);
+        assert!(vp_owner == tx_context::sender(ctx), EUnauthorized);
+        assert!(!vp_collateralized, EInvalidVestingPosition);
+
+        let vesting_position_id = object::id(vesting_position);
 
         let uid = object::new(ctx);
         let id = object::uid_to_inner(&uid);
@@ -552,7 +574,7 @@ module equinox::market {
         
         let order = table::remove(&mut market.orders, order_id);
         assert!(order.is_lend, EOrderNotFound);
-        assert!(order.creator == tx_context::sender(ctx), EOrderNotFound);
+        assert!(order.creator == tx_context::sender(ctx), EUnauthorized);
 
         let balance = table::remove(&mut market.lend_balances, order_id);
         market.active_orders = market.active_orders - 1;
@@ -576,7 +598,7 @@ module equinox::market {
         
         let order = table::remove(&mut market.orders, order_id);
         assert!(!order.is_lend, EOrderNotFound);
-        assert!(order.creator == tx_context::sender(ctx), EOrderNotFound);
+        assert!(order.creator == tx_context::sender(ctx), EUnauthorized);
 
         let balance = table::remove(&mut market.collateral_balances, order_id);
         market.active_orders = market.active_orders - 1;
@@ -758,6 +780,21 @@ module equinox::market {
         });
     }
 
+    /// Deterministic match entry — no Nautilus enclave required.
+    /// Settles a (lend, borrow) pair via classical price-time priority rules:
+    ///   borrow.rate >= lend.rate, lend.duration >= borrow.duration, amounts equal.
+    /// Use this when the off-chain fairness service is unavailable. Anyone can call it,
+    /// because the rule set is fully verifiable on-chain.
+    public entry fun match_best_offer<Asset, Collateral>(
+        market: &mut Market<Asset, Collateral>,
+        lend_order_id: ID,
+        borrow_order_id: ID,
+        clock: &Clock,
+        ctx: &mut TxContext
+    ) {
+        match_orders_internal(market, lend_order_id, borrow_order_id, clock, ctx);
+    }
+
     #[test_only]
     public fun match_orders_for_testing<Asset, Collateral>(
         market: &mut Market<Asset, Collateral>,
@@ -771,50 +808,9 @@ module equinox::market {
 
     // ============== LIQUIDATION VIA DEEPBOOK ==============
 
-    /// Liquidate via DeepBook Swap using swap_exact_quantity
-    /// This function uses DeepBook V3's swap function for liquidation
-    public fun liquidate_via_deepbook<Asset, Collateral>(
-        loan: loan::Loan<Asset, Collateral>,
-        db_pool: &mut Pool<Collateral, Asset>,
-        deep_coin: Coin<DEEP>,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ): (Coin<Asset>, Coin<Collateral>, Coin<DEEP>) {
-        // 1. Unwrap the defaulted loan
-        let (collateral_balance, total_debt, lender) = loan::unwrap_for_liquidation(loan, clock);
-        
-        // 2. Convert collateral to coin
-        let collateral_coin = coin::from_balance(collateral_balance, ctx);
-        
-        // 3. Swap collateral for asset using DeepBook V3
-        // swap_exact_quantity: base_in, quote_in, deep_in, min_out, clock, ctx
-        // We're selling collateral (base) for asset (quote)
-        let quote_in = coin::zero<Asset>(ctx);
-        
-        let (base_out, quote_out, deep_out) = db_pool::swap_exact_quantity(
-            db_pool,
-            collateral_coin,  // base_in (collateral to sell)
-            quote_in,         // quote_in (0, we're buying quote)
-            deep_coin,        // deep_in (for fees)
-            total_debt,       // min_out (minimum asset we need)
-            clock,
-            ctx
-        );
-
-        // 4. Verify we got enough to cover debt
-        let asset_received = coin::value(&quote_out);
-        assert!(asset_received >= total_debt, EInsufficientLiquidation);
-        
-        // 5. Split payment for lender
-        let mut quote_out_mut = quote_out;
-        let debt_payment = coin::split(&mut quote_out_mut, total_debt, ctx);
-        transfer::public_transfer(debt_payment, lender);
-        
-        // 6. Return remaining assets to liquidator
-        (quote_out_mut, base_out, deep_out)
-    }
-
-    /// Entry function for liquidation
+    /// Entry function for DeepBook-routed liquidation of a defaulted loan.
+    /// Pays lender the principal+interest, returns remaining swap output (and base/deep dust)
+    /// to the liquidator as their reward.
     public entry fun liquidate_and_swap<Asset, Collateral>(
         loan: loan::Loan<Asset, Collateral>,
         db_pool: &mut Pool<Collateral, Asset>,
@@ -823,16 +819,12 @@ module equinox::market {
         ctx: &mut TxContext
     ) {
         let loan_id = object::id(&loan);
-        let (collateral_balance, total_debt, _) = loan::unwrap_for_liquidation(loan, clock);
+        let (collateral_balance, total_debt, lender) = loan::unwrap_for_liquidation(loan, clock);
         let collateral_amount = balance::value(&collateral_balance);
-        
-        // Reconstruct the loan for the actual liquidation call
-        // Note: In production, you'd want to avoid double unwrapping
-        // For now, we'll handle this differently
-        
+
         let collateral_coin = coin::from_balance(collateral_balance, ctx);
         let quote_in = coin::zero<Asset>(ctx);
-        
+
         let (base_out, quote_out, deep_out) = db_pool::swap_exact_quantity(
             db_pool,
             collateral_coin,
@@ -844,8 +836,14 @@ module equinox::market {
         );
 
         let asset_received = coin::value(&quote_out);
-        let profit = if (asset_received > total_debt) { asset_received - total_debt } else { 0 };
-        
+        assert!(asset_received >= total_debt, EInsufficientLiquidation);
+        let profit = asset_received - total_debt;
+
+        // Pay lender principal + interest first, liquidator keeps the rest
+        let mut quote_remaining = quote_out;
+        let lender_payment = coin::split(&mut quote_remaining, total_debt, ctx);
+        transfer::public_transfer(lender_payment, lender);
+
         event::emit(LoanLiquidated {
             loan_id,
             liquidator: tx_context::sender(ctx),
@@ -854,15 +852,18 @@ module equinox::market {
             debt_repaid: total_debt,
             profit,
         });
-        
-        // Transfer outputs to liquidator
+
         let sender = tx_context::sender(ctx);
         if (coin::value(&base_out) > 0) {
             transfer::public_transfer(base_out, sender);
         } else {
             coin::destroy_zero(base_out);
         };
-        transfer::public_transfer(quote_out, sender);
+        if (coin::value(&quote_remaining) > 0) {
+            transfer::public_transfer(quote_remaining, sender);
+        } else {
+            coin::destroy_zero(quote_remaining);
+        };
         if (coin::value(&deep_out) > 0) {
             transfer::public_transfer(deep_out, sender);
         } else {

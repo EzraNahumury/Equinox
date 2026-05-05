@@ -7,13 +7,17 @@ import {
   buildCreateOrderTx,
   buildLockVestingTx,
   buildUnlockVestingTx,
-  buildDepositToVaultTx,
   buildCreateBorrowTx,
   buildRepayLoanTx,
   buildMintTokenTx,
   buildMatchOrdersTx,
+  buildMatchBestOfferTx,
   buildLiquidateLoanTx,
+  buildVaultDepositTx,
+  buildVaultWithdrawTx,
+  buildExecuteAllocationLegTx,
 } from "@/lib/sui/transactions";
+import { env } from "@/lib/config";
 
 export interface TransactionResult {
   success: boolean;
@@ -183,31 +187,6 @@ export async function executeUnlockVesting(
   }
 }
 
-export async function executeDeposit(
-  params: {
-    vaultId: string;
-    amount: number;
-    coinObjectId: string;
-  },
-  userAddress: string
-): Promise<TransactionResult> {
-  if (isMockMode()) {
-    // Mock deposit logic if needed
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    return { success: true, digest: `mock_${Date.now()}` };
-  }
-
-  try {
-    const tx = buildDepositToVaultTx(params);
-    return await executeTransaction(tx, userAddress);
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Failed to create deposit transaction",
-    };
-  }
-}
-
 export async function executeBorrow(
   params: {
     collateralCoinId: string;
@@ -286,6 +265,108 @@ export async function executeLiquidate(
   }
 }
 
+export async function executeVaultDeposit(
+  params: { vaultId: string; asset: string; amount: number; coinObjectId?: string },
+  userAddress: string,
+): Promise<TransactionResult> {
+  if (isMockMode()) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return { success: true, digest: `mock_vault_${Date.now()}` };
+  }
+  try {
+    const tx = buildVaultDepositTx(params);
+    return await executeTransaction(tx, userAddress);
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : "Vault deposit failed" };
+  }
+}
+
+export async function executeVaultWithdraw(
+  params: { vaultId: string; asset: string; amount: number },
+  userAddress: string,
+): Promise<TransactionResult> {
+  if (isMockMode()) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return { success: true, digest: `mock_vault_w_${Date.now()}` };
+  }
+  try {
+    const tx = buildVaultWithdrawTx(params);
+    return await executeTransaction(tx, userAddress);
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : "Vault withdraw failed" };
+  }
+}
+
+/**
+ * Ask the Nautilus enclave to design an allocation across `legs`, then submit each leg
+ * sequentially. Returns the per-leg digests so the UI can show partial progress.
+ */
+export async function executeAllocationPlan(
+  params: {
+    vaultId: string;
+    enclaveId: string;
+    asset: string;
+    collateral: string;
+    amount: number;
+    legs: { marketId: string; weight: number; rateBps: number; durationMs: number }[];
+  },
+  userAddress: string,
+): Promise<{ legResults: TransactionResult[]; success: boolean }> {
+  const { signAllocationPlan } = await import("@/lib/nautilus");
+
+  let signedLegs;
+  try {
+    signedLegs = await signAllocationPlan({
+      vaultId: params.vaultId,
+      amount: params.amount,
+      legs: params.legs,
+    });
+  } catch (e) {
+    return {
+      legResults: [
+        {
+          success: false,
+          error: e instanceof Error ? e.message : "Failed to sign allocation plan",
+        },
+      ],
+      success: false,
+    };
+  }
+
+  const legResults: TransactionResult[] = [];
+  for (const leg of signedLegs) {
+    if (isMockMode()) {
+      legResults.push({ success: true, digest: `mock_alloc_${leg.nonce}_${leg.marketId.slice(0, 6)}` });
+      continue;
+    }
+    try {
+      const tx = buildExecuteAllocationLegTx({
+        vaultId: params.vaultId,
+        enclaveId: params.enclaveId,
+        marketId: leg.marketId,
+        asset: params.asset,
+        collateral: params.collateral,
+        nonce: leg.nonce,
+        amount: leg.amount,
+        rateBps: leg.rateBps,
+        durationMs: leg.durationMs,
+        signature: leg.signature,
+      });
+      const result = await executeTransaction(tx, userAddress);
+      legResults.push(result);
+      if (!result.success) break;
+    } catch (e) {
+      legResults.push({
+        success: false,
+        error: e instanceof Error ? e.message : "Allocation leg execution failed",
+      });
+      break;
+    }
+  }
+
+  return { legResults, success: legResults.every((r) => r.success) };
+}
+
 export async function executeMintToken(
   asset: string,
   amount: number,
@@ -358,6 +439,7 @@ export async function executeMatchOrders(
   userAddress: string,
   // Optional additional parameters for better fairness calculation
   options?: {
+    collateral?: string;
     lendAmount?: number;
     borrowAmount?: number;
     lendRate?: number;
@@ -367,136 +449,92 @@ export async function executeMatchOrders(
     isVested?: boolean;
   }
 ): Promise<TransactionResult & { fairnessScore?: number; finalRate?: number }> {
-  if (isMockMode()) {
-    // Mock mode: simulate Nautilus computation
+  const fairnessRequest = {
+    lendOrderId,
+    borrowOrderId,
+    lendAmount: options?.lendAmount ?? 0,
+    borrowAmount: options?.borrowAmount ?? 0,
+    lendRate: options?.lendRate ?? 0,
+    borrowRate: options?.borrowRate ?? 0,
+    lenderAddress: options?.lenderAddress || userAddress,
+    borrowerAddress: options?.borrowerAddress || userAddress,
+    isVested: options?.isVested,
+  };
+
+  // Try to compute the fairness score. Failure must NOT abort the match — we fall back to
+  // the deterministic on-chain entry so users can still settle.
+  let fairnessScore: number | undefined;
+  let finalRate: number | undefined;
+  let fairnessSignature: Uint8Array | undefined;
+  let fairnessError: string | undefined;
+  try {
     const { computeFairnessScore } = await import("@/lib/nautilus");
-    
-    const fairnessResult = await computeFairnessScore({
-      lendOrderId,
-      borrowOrderId,
-      lendAmount: options?.lendAmount || 1000,
-      borrowAmount: options?.borrowAmount || 1000,
-      lendRate: options?.lendRate || 5,
-      borrowRate: options?.borrowRate || 7,
-      lenderAddress: options?.lenderAddress || userAddress,
-      borrowerAddress: options?.borrowerAddress || userAddress,
-      isVested: options?.isVested,
-    });
+    const fairnessResult = await computeFairnessScore(fairnessRequest);
+    fairnessScore = fairnessResult.score;
+    finalRate = fairnessResult.finalRate;
+    fairnessSignature = fairnessResult.signature;
+  } catch (e) {
+    fairnessError = e instanceof Error ? e.message : "fairness compute failed";
+    console.warn("Nautilus fairness compute failed, falling back to deterministic match:", fairnessError);
+  }
 
-    console.log("Nautilus Fairness Result:", {
-      score: fairnessResult.score,
-      finalRate: fairnessResult.finalRate,
-      breakdown: fairnessResult.scoreBreakdown,
-    });
-
-    // Execute mock matching
-    MockState.matchOrders(lendOrderId, borrowOrderId);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    
-    return { 
-      success: true, 
-      digest: `mock_nautilus_${Date.now()}`,
-      fairnessScore: fairnessResult.score,
-      finalRate: fairnessResult.finalRate,
+  const minScore = env.matching.minFairnessScore;
+  if (minScore > 0 && fairnessScore !== undefined && fairnessScore < minScore) {
+    return {
+      success: false,
+      error: `Fairness score ${fairnessScore} below threshold ${minScore}`,
+      fairnessScore,
+      finalRate,
     };
   }
 
-  // Real mode: Use Nautilus enclave for fairness computation
-  try {
-    const { computeFairnessScore, formatSignatureForChain } = await import("@/lib/nautilus");
-    
-    // 1. Compute fairness score via Nautilus
-    const fairnessResult = await computeFairnessScore({
-      lendOrderId,
-      borrowOrderId,
-      lendAmount: options?.lendAmount || 1000,
-      borrowAmount: options?.borrowAmount || 1000,
-      lendRate: options?.lendRate || 5,
-      borrowRate: options?.borrowRate || 7,
-      lenderAddress: options?.lenderAddress || userAddress,
-      borrowerAddress: options?.borrowerAddress || userAddress,
-      isVested: options?.isVested,
-    });
-
-    console.log("Nautilus Fairness Computation:", {
-      score: fairnessResult.score,
-      finalRate: fairnessResult.finalRate,
-      breakdown: fairnessResult.scoreBreakdown,
-    });
-
-    // 2. Build transaction with Nautilus signature
-    // NOTE: For full on-chain verification, we need:
-    // - Registered enclave on-chain (EnclaveConfig object)
-    // - RegisteredEnclave object with matching public key
-    // For hackathon demo without on-chain enclave registration,
-    // we simulate the matching in mock mode.
-    
-    // 3. Build and execute on-chain match transaction
-    const enclaveId = process.env.NEXT_PUBLIC_NAUTILUS_ENCLAVE_ID;
-    
-    if (!enclaveId) {
-       throw new Error("Enclave ID is missing. Please set NEXT_PUBLIC_NAUTILUS_ENCLAVE_ID in .env.local");
-    }
-
-    const tx = new Transaction();
-    // Import env properly
-    const { env } = await import("@/lib/config");
-    const packageId = env.sui.packageId;
-    // Default market ID (USDC/SUI)
-    const marketId = env.sui.marketId; 
-
-    if (!packageId) throw new Error("Package ID not configured");
-    if (!marketId) throw new Error("Market ID not configured");
-
-    // Helper to get asset type
-    const getAssetCoinType = (assetName: string): string => {
-        // This should match your Move contract types
-        const upper = assetName.toUpperCase();
-        if (upper === "SUI") return "0x2::sui::SUI";
-        if (upper === "USDC") return `${packageId}::mock_usdc::MOCK_USDC`;
-        if (upper === "ETH") return `${packageId}::mock_eth::MOCK_ETH`;
-        return `${packageId}::mock_usdc::MOCK_USDC`; // Default fallback
+  if (isMockMode()) {
+    MockState.matchOrders(lendOrderId, borrowOrderId);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return {
+      success: true,
+      digest: `mock_nautilus_${Date.now()}`,
+      fairnessScore,
+      finalRate,
     };
+  }
 
-    console.log("Building Match Order Tx:", {
-        marketId,
-        enclaveId,
-        lendOrderId,
-        borrowOrderId,
-        fairnessScore: fairnessResult.score,
-        proofLength: fairnessResult.signature.length
-    });
+  // Real mode: prefer the Nautilus-verified entry, fall back to the deterministic one.
+  try {
+    const enclaveId = process.env.NEXT_PUBLIC_NAUTILUS_ENCLAVE_ID;
+    const collateral = options?.collateral || "SUI";
 
-    tx.moveCall({
-      target: `${packageId}::market::match_orders`,
-      typeArguments: [
-        getAssetCoinType(asset),
-        "0x2::sui::SUI", // Collateral type hardcoded to SUI for now based on context
-      ],
-      arguments: [
-        tx.object(marketId),
-        tx.object(enclaveId), // Enclave Shared Object
-        tx.pure.address(lendOrderId),
-        tx.pure.address(borrowOrderId),
-        tx.pure.u64(fairnessResult.score),
-        tx.pure.vector("u8", Array.from(fairnessResult.signature)),
-        tx.object("0x6"), // Clock object
-      ],
-    });
+    const useNautilusPath = enclaveId && fairnessSignature && fairnessScore !== undefined;
+    const tx = useNautilusPath
+      ? buildMatchOrdersTx({
+          lendOrderId,
+          borrowOrderId,
+          asset,
+          collateral,
+          enclaveId: enclaveId!,
+          fairnessScore: fairnessScore!,
+          fairnessProof: fairnessSignature!,
+        })
+      : buildMatchBestOfferTx({
+          lendOrderId,
+          borrowOrderId,
+          asset,
+          collateral,
+        });
 
     const result = await executeTransaction(tx, userAddress);
-    
     return {
       ...result,
-      fairnessScore: fairnessResult.score,
-      finalRate: fairnessResult.finalRate,
+      fairnessScore,
+      finalRate,
     };
-
   } catch (error) {
-    console.error("Nautilus matching error:", error);
+    console.error("Match execution error:", error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : "Nautilus matching failed",
+      error: error instanceof Error ? error.message : "Match execution failed",
+      fairnessScore,
+      finalRate,
     };
   }
 }

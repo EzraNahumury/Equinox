@@ -19,8 +19,10 @@ A Fair and Inclusive Order Book-Based Multi-Collateral DeFi Lending Protocol Nat
   - [Borrower Journey](#borrower-journey)
   - [Matching Engine](#matching-engine)
   - [Vesting Integration](#vesting-integration)
+  - [Aggregator Vault (Nautilus-driven Yield Router)](#aggregator-vault-nautilus-driven-yield-router)
 - [Technical Architecture](#technical-architecture)
 - [Deployed Contracts](#deployed-contracts)
+- [Quick Start](#quick-start)
 - [Why Sui Blockchain](#why-sui-blockchain)
 - [Links](#links)
 
@@ -218,22 +220,26 @@ Position privacy is designed to protect whale lenders:
 
 ### Matching Engine
 
-The matching engine operates in two phases:
+The matching engine runs client-side as a deterministic ranker and falls back to a pure on-chain entry when the off-chain enclave is unavailable.
 
-**Phase 1: Criteria Verification**
+**Phase 1: Client-side Ranking (`lib/matching/ranker.ts`)**
 
-- Borrower rate >= Lender minimum rate
-- Borrower LTV <= Lender maximum LTV
-- Compatible term durations
-- Acceptable collateral types match across supported assets
+- Filter pairs that pass the protocol rules: borrower rate ≥ lender minimum rate, lender duration ≥ borrower duration, asset and collateral types align, amount delta within tolerance.
+- Score the surviving pairs with a composite signal:
+  - **Size fit (45%)** — closer amounts settle more reliably on-chain.
+  - **Duration fit (25%)** — terms that match avoid early-recall friction.
+  - **Rate spread (20%)** — wider gap → more economic surplus to share.
+  - **Age priority (10%)** — older orders (price-time priority).
+- Surface the breakdown to the user in a preview modal before signing.
 
-**Phase 2: Fairness Optimization (Nautilus AI)**
+**Phase 2: Settlement**
 
-- Calculate fairness score for each potential match
-- Apply retail boost for smaller orders
-- Penalize over-concentration with single counterparties
-- Verify computation on-chain
-- Finalize via Mysticeti consensus with approximately 400ms latency
+The user picks one of two paths from the preview modal:
+
+- `match_orders` — Nautilus enclave signs the (lend_id, borrow_id, score) tuple. The Move contract verifies the Ed25519 signature against a registered enclave before settling.
+- `match_best_offer` — pure on-chain entry, no Nautilus dependency. Anyone can call it; the Move contract enforces the same rule set deterministically. Used automatically as fallback when the enclave call fails or is unconfigured.
+
+Both paths converge on the same loan creation logic: midpoint rate, lender receives the `Loan<Asset, Collateral>` object, borrower receives the principal, collateral locks inside the loan object until repayment or liquidation. Mysticeti finality lands matches in ~400 ms.
 
 ### Vesting Integration
 
@@ -245,61 +251,144 @@ Vested token holders follow a specialized flow:
 4. **Priority Matching** - Gain matching priority as collateral provider
 5. **Ecosystem Impact** - Contribute to reduced selling pressure and improved token stability
 
+### Aggregator Vault (Nautilus-driven Yield Router)
+
+A separate path for users who want passive yield without managing individual orders. The vault holds a single asset and routes capital across multiple markets according to plans signed by the Nautilus enclave.
+
+**Flow**
+
+1. **Deposit** - User calls `vault::deposit` and receives shares 1:1 with the underlying asset.
+2. **Plan Request** - The keeper asks the enclave for an allocation plan: a list of `(market, amount, rate, duration)` legs.
+3. **Plan Signing** - The enclave signs each leg as `vault_id || nonce || market_id || amount || rate || duration` (all u64 little-endian).
+4. **Execution** - The keeper submits each leg via `vault::execute_allocation_leg`. The Move contract verifies the Ed25519 signature against the registered enclave key before splitting the deposit and placing a lend order on the target market.
+5. **Withdraw** - Idle balance can be withdrawn at any time via `vault::withdraw` (subject to capital not currently deployed).
+
+This is where the verifiable off-chain compute story actually pays off: the enclave's recommendation is non-trivial (multi-market yield optimization) and the on-chain check is cheap (one signature verification per leg).
+
 ---
 
 ## Technical Architecture
 
 ### Smart Contracts (Move Language)
 
-- **Market Module** - Multi-collateral order book management with support for USDC, SUI, and ETH
-- **LoanObject Module** - Creates independent objects for each loan position
-- **Registry Module** - Asset registry for supported collateral types and configurations
-- **VestingVault Module** - Manages lock-up mechanics with subsidy distribution
+- **Market Module** - Multi-collateral order book management with support for USDC, SUI, and ETH. Provides two settlement entries: `match_orders` (Nautilus-signed fairness proof) and `match_best_offer` (deterministic price-time priority, no enclave required as fallback).
+- **Loan Module** - Creates independent objects for each loan position. `repay` and `liquidate_defaulted_loan` refund overpayment to the caller and pay the lender principal + interest.
+- **Registry Module** - Asset registry for supported collateral types and configurations (max LTV, liquidation threshold, liquidation bonus, DeepBook pool routing).
+- **Vesting Module** - Manages lock-up mechanics with Groth16 BN254 ZK proof verification, subsidy distribution, and collateralization hooks. Vested borrow orders require an authenticated `&VestingPosition` reference to claim the priority boost.
+- **Vault Module** - `AggregatorVault<T>` Nautilus-driven yield router. Users deposit a single asset; the off-chain enclave designs an allocation plan and signs each leg; the vault verifies signatures on-chain before routing capital across markets.
 
 ### Off-Chain Infrastructure
 
-- **Nautilus** - Verifiable AI compute for fairness scoring and match optimization
-- **Walrus** - Decentralized storage for vesting proofs and historical order data
+- **Nautilus** - Verifiable off-chain compute. Two integration paths:
+  - Fairness scoring for order matching (optional, with deterministic fallback).
+  - Allocation planner for the aggregator vault (signs `vault‖nonce‖market‖amount‖rate‖duration` per leg).
+- **Walrus** - Decentralized storage for vesting proofs and historical order data.
 
 ### Frontend Application
 
-- **Framework** - Next.js with React
-- **Authentication** - Sui zkLogin SDK integration
-- **Interface** - Gamified dashboard with real-time fairness metrics and position privacy controls
+- **Framework** - Next.js 16 with React 19.
+- **Matching engine** - Pure deterministic ranker (`lib/matching/ranker.ts`) ranks all viable (lend, borrow) pairs by composite score: size fit, duration fit, rate spread, age priority. Top match drives the on-chain settlement.
+- **Authentication** - Sui zkLogin SDK + Enoki API for custom OAuth client IDs.
+- **Interface** - Gamified dashboard with real-time fairness metrics, match preview modal, position privacy controls.
+- **Tests** - `npm test` runs vitest. Unit + 100-order simulation for the ranker.
 
 ### External Integrations
 
-- **DeepBook** - Liquidation routing and referral revenue
-- **Price Oracles** - Supra or Pyth for accurate collateral valuation
-- **Mysticeti** - Sui's consensus mechanism for fast finality
+- **DeepBook V3** - Liquidation routing via `swap_exact_quantity`; lender is paid first, liquidator keeps the swap surplus.
+- **Price Oracles** - Pyth Network for accurate collateral valuation.
+- **Mysticeti** - Sui's consensus mechanism for sub-second finality.
 
 ---
 
 ## Deployed Contracts
 
-The following contracts are deployed on Sui Testnet:
+The following contracts are deployed on Sui Testnet.
 
-### Package and Module Addresses
+### Core Package and Shared Objects
 
-| Component          | Address                                                              |
-| ------------------ | -------------------------------------------------------------------- |
-| Package ID         | `0x60db99c5af7bea80b5ff36922cf73964688923449e59347457be8e6e20e4c13a` |
-| Registry           | `0xa62c9a091b001bb7e76fb416c8a87e426e468bca4d05a01f8c0418d4b762b741` |
-| Vesting Vault      | `0x8b6592ee78b218513582a509f68fe1905ac3dc2d7d122c1a51a50f4e9be1ddf1` |
-| Market (Orderbook) | `0x0878c322476450da4ba9b5abd7e6cec4c2db1a9ab14fc77bde3237858f6cb86e` |
+| Component               | Address                                                              |
+| ----------------------- | -------------------------------------------------------------------- |
+| Package ID              | `0xb4131de782309ff0f9abf46f9eebe92984b2b62dc0edc67917241937b222c373` |
+| Registry                | `0xd2387d19331d4e1a791fd4345d1d8b695228beecfae9f8497b5f8483531c5419` |
+| Registry AdminCap       | `0x184078a57b62fedaf01f361558c352cfafc84a49d8977405ba3389a656477bf6` |
+| Legacy Vesting Vault    | `0x2490fbec70b7a49037a64589dc67fd8a834a5b422aabac0977e050462fd9a4cf` |
 
-### Admin Capabilities
+### Markets
+
+| Pair (Asset / Collateral) | Market ID                                                            |
+| ------------------------- | -------------------------------------------------------------------- |
+| USDC / SUI                | `0x9f75f8a3eecfbaa128475d85b9d0482644c5cfa501f09a9c1ea0c14d71f976d2` |
+| SUI / USDC                | `0xb2318f3f519aca72ad575a4cffdd74d34564d2c12082fdc56a3af6baa4869862` |
+
+### Aggregator Vault (Nautilus-driven yield router)
+
+| Component                   | Address                                                              |
+| --------------------------- | -------------------------------------------------------------------- |
+| AggregatorVault<MOCK_USDC>  | `0x55ffa907ec596c1f495d485dc735e82f6d62cdfb470cfe9f3e37d6f61b416ff9` |
+
+### Nautilus Enclave
+
+| Component         | Address                                                              |
+| ----------------- | -------------------------------------------------------------------- |
+| EnclaveConfig     | `0x444fdef3865dbe58b1d9e3e44e2d13587a1453ac5bd4926c48380bcb4b86c479` |
+| RegisteredEnclave | `0x31f7b357bf062d6d298b3844f988bc3017b9110669d69a03643afe5e17bed161` |
+
+### Faucet Capabilities (shared, public mint)
 
 | Asset          | Admin Cap ID                                                         |
 | -------------- | -------------------------------------------------------------------- |
-| USDC Admin Cap | `0xffa94cd074e29ce7fbe7aa43690144b53afeec6aaa5c6239eb3090434c78c62d` |
-| ETH Admin Cap  | `0x9e18bfaa3227bc3ff2117d38a061fbdba372f02c66581ce7279b264a73573e5c` |
+| USDC Admin Cap | `0x09c36d6877c00fe9ac1eaa49e367e2ffc47a1f8d2d156ca488ece2ab2c31371f` |
+| ETH Admin Cap  | `0x530478a6bb66575f95a913f815771ce42df0196bbbde59494c79cbf1c6b9193f` |
+
+### Registry Configuration
+
+| Asset | Role                | Max LTV | Liquidation Threshold | Liquidation Bonus |
+| ----- | ------------------- | ------- | --------------------- | ----------------- |
+| SUI   | Asset + Collateral  | 75%     | 85%                   | 5%                |
+| USDC  | Asset + Collateral  | 80%     | 85%                   | 3%                |
+| ETH   | Asset + Collateral  | 70%     | 80%                   | 5%                |
+
+Interest rate band per asset: 1% — 50% APR.
 
 ### Network Configuration
 
 - **Network**: Sui Testnet
 - **RPC URL**: https://fullnode.testnet.sui.io:443
-- **Deployment Date**: 2026-02-08
+- **Deployment Date**: 2026-05-05
+- **Deployer**: `0x8c4551885e339c4b2cd88cb96f0fe34186a5a1dd03667957187c257c02e88776`
+
+---
+
+## Quick Start
+
+### Frontend
+
+```bash
+cd equinox-interface
+cp .env.example .env.local   # already populated with deployed object IDs in this repo
+npm install
+npm run dev                   # http://localhost:3000
+npm test                      # vitest — ranker unit + 100-order simulation
+```
+
+### Move contracts
+
+```bash
+cd contracts/equinox
+sui move build                # compile
+sui move test                 # 12 unit tests including match_best_offer settlement
+```
+
+### Bootstrap a fresh deployment
+
+If you republish the package, repeat these on-chain steps in order (the deployer must hold the registry `AdminCap`):
+
+1. `registry::add_collateral<T>` for SUI, USDC, ETH (max LTV / liq threshold / liq bonus).
+2. `registry::add_asset<T>` for SUI, USDC, ETH (min / max interest rate basis points).
+3. `market::create_market_standalone<Asset, Collateral>` for each pair you want to expose.
+4. `vault::create_vault<T>` to spin up an aggregator vault for the chosen asset.
+5. `market::register_enclave_config` then `market::register_enclave` with the Ed25519 public key derived from `NEXT_PUBLIC_NAUTILUS_DEV_PRIVATE_KEY`.
+6. Update `equinox-interface/.env.local` with the new object IDs.
 
 ---
 

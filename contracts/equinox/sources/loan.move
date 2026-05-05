@@ -37,7 +37,7 @@ module equinox::loan {
 
     public struct LoanRepaid has copy, drop {
         loan_id: ID,
-        perpayer: address,
+        repayer: address,
         amount: u64,
         interest_paid: u64,
     }
@@ -116,29 +116,30 @@ module equinox::loan {
     }
 
     /// Repay a loan with Real Interest Calculation.
+    /// Excess payment above the debt is refunded to the caller.
     public entry fun repay<Asset, Collateral>(
         loan: Loan<Asset, Collateral>,
-        payment: Coin<Asset>,
+        mut payment: Coin<Asset>,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
         let amount_paid = coin::value(&payment);
         let total_debt = calculate_debt(&loan, clock);
-        
+
         // Strict check: Payment must cover total debt
-        assert!(amount_paid >= total_debt, 0); 
-        
+        assert!(amount_paid >= total_debt, 0);
+
         let interest_paid = total_debt - loan.amount;
 
-        let Loan { 
-            id, 
-            borrower, 
-            lender, 
-            amount: _, 
-            interest_rate_bps: _, 
-            start_timestamp: _, 
-            duration: _, 
-            collateral_balance 
+        let Loan {
+            id,
+            borrower,
+            lender,
+            amount: _,
+            interest_rate_bps: _,
+            start_timestamp: _,
+            duration: _,
+            collateral_balance
         } = loan;
 
         let loan_id = object::uid_to_inner(&id);
@@ -146,15 +147,22 @@ module equinox::loan {
 
         event::emit(LoanRepaid {
             loan_id,
-            perpayer: tx_context::sender(ctx),
+            repayer: tx_context::sender(ctx),
             amount: total_debt,
             interest_paid,
         });
-        
-        // 1. Send Payment (Debt) to Lender
+
+        // 1. Refund any overpayment back to the caller
+        let sender = tx_context::sender(ctx);
+        if (amount_paid > total_debt) {
+            let refund = coin::split(&mut payment, amount_paid - total_debt, ctx);
+            transfer::public_transfer(refund, sender);
+        };
+
+        // 2. Send debt payment to Lender
         transfer::public_transfer(payment, lender);
 
-        // 2. Return Collateral to Borrower
+        // 3. Return Collateral to Borrower
         let collateral = coin::from_balance(collateral_balance, ctx);
         transfer::public_transfer(collateral, borrower);
     }
@@ -166,12 +174,12 @@ module equinox::loan {
     /// The Lender gets their Principal + Interest.
     public entry fun liquidate_defaulted_loan<Asset, Collateral>(
         loan: Loan<Asset, Collateral>,
-        payment: Coin<Asset>,
+        mut payment: Coin<Asset>,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
         let current_time = clock::timestamp_ms(clock);
-        
+
         // 1. Check if Defaulted (Overdue)
         assert!(current_time > loan.start_timestamp + loan.duration, 1);
 
@@ -181,31 +189,38 @@ module equinox::loan {
         assert!(amount_paid >= total_debt, 0);
 
         // 3. Destructure Loan
-        let Loan { 
-            id, 
-            borrower: _, 
-            lender, 
-            amount: _, 
-            interest_rate_bps: _, 
-            start_timestamp: _, 
-            duration: _, 
-            collateral_balance 
+        let Loan {
+            id,
+            borrower: _,
+            lender,
+            amount: _,
+            interest_rate_bps: _,
+            start_timestamp: _,
+            duration: _,
+            collateral_balance
         } = loan;
 
         let loan_id = object::uid_to_inner(&id);
         let collateral_amount = balance::value(&collateral_balance);
         object::delete(id);
 
-        // 4. Pay Lender
+        // 4. Refund any overpayment to the liquidator
+        let sender = tx_context::sender(ctx);
+        if (amount_paid > total_debt) {
+            let refund = coin::split(&mut payment, amount_paid - total_debt, ctx);
+            transfer::public_transfer(refund, sender);
+        };
+
+        // 5. Pay Lender
         transfer::public_transfer(payment, lender);
 
-        // 5. Seize Collateral (Give to Liquidator)
+        // 6. Seize Collateral (Give to Liquidator)
         let collateral = coin::from_balance(collateral_balance, ctx);
-        transfer::public_transfer(collateral, tx_context::sender(ctx));
+        transfer::public_transfer(collateral, sender);
 
         event::emit(LoanLiquidated {
             loan_id,
-            liquidator: tx_context::sender(ctx),
+            liquidator: sender,
             repayment_amount: total_debt,
             collateral_seized: collateral_amount,
         });

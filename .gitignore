@@ -44,3 +44,6 @@ next-env.d.ts
 
 # Move / Sui
 Move.lock
+
+# Claude Code local state
+.claude/

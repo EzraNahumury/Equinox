@@ -653,4 +653,76 @@ module equinox::tests {
         clock::destroy_for_testing(clock);
         ts::end(scenario);
     }
+
+    // ============== MATCH ENTRY TESTS ==============
+
+    #[test]
+    fun test_match_best_offer_settles_pair() {
+        let mut scenario = ts::begin(ADMIN);
+        let mut clock = create_clock(&mut scenario);
+
+        ts::next_tx(&mut scenario, ADMIN);
+        {
+            market::create_market_standalone<SUI, SUI>(
+                vector::empty<u8>(),
+                ts::ctx(&mut scenario),
+            );
+        };
+
+        ts::next_tx(&mut scenario, LENDER);
+        let lend_id;
+        {
+            let mut market = ts::take_shared<Market<SUI, SUI>>(&scenario);
+            let payment = coin::mint_for_testing<SUI>(500_000_000_000, ts::ctx(&mut scenario));
+            lend_id = market::place_lend_order(
+                &mut market,
+                payment,
+                300,                // 3%
+                86400000 * 30,
+                &clock,
+                ts::ctx(&mut scenario),
+            );
+            ts::return_shared(market);
+        };
+
+        ts::next_tx(&mut scenario, BORROWER);
+        let borrow_id;
+        {
+            let mut market = ts::take_shared<Market<SUI, SUI>>(&scenario);
+            let collateral = coin::mint_for_testing<SUI>(800_000_000_000, ts::ctx(&mut scenario));
+            borrow_id = market::place_borrow_order_standalone(
+                &mut market,
+                collateral,
+                500_000_000_000,
+                500,                // 5% — borrower willing to pay above lender's 3%
+                86400000 * 14,
+                &clock,
+                ts::ctx(&mut scenario),
+            );
+            ts::return_shared(market);
+        };
+
+        // Anyone can call match_best_offer once the rules pass.
+        ts::next_tx(&mut scenario, LIQUIDATOR);
+        {
+            let mut market = ts::take_shared<Market<SUI, SUI>>(&scenario);
+            market::match_best_offer<SUI, SUI>(
+                &mut market,
+                lend_id,
+                borrow_id,
+                &clock,
+                ts::ctx(&mut scenario),
+            );
+            ts::return_shared(market);
+        };
+
+        // Lender now holds the loan object as proof of settlement.
+        ts::next_tx(&mut scenario, LENDER);
+        {
+            assert!(ts::has_most_recent_for_sender<Loan<SUI, SUI>>(&scenario), 0);
+        };
+
+        clock::destroy_for_testing(clock);
+        ts::end(scenario);
+    }
 }

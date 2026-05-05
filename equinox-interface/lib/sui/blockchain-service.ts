@@ -43,12 +43,20 @@ function isValidSuiAddress(address: string): boolean {
   return /^[0-9a-fA-F]+$/.test(cleanAddress);
 }
 
+// Map a Move type-string to the symbol used in the UI.
+function symbolFromMoveType(typeStr: string): string {
+  if (typeStr.includes("mock_usdc") || typeStr.includes("MOCK_USDC")) return "USDC";
+  if (typeStr.includes("mock_eth") || typeStr.includes("MOCK_ETH")) return "ETH";
+  if (typeStr.toLowerCase().includes("::sui::sui")) return "SUI";
+  return "UNKNOWN";
+}
+
 /**
  * Fetch orders from blockchain
  * In real mode: Queries blockchain for Order objects from Market table
  * In mock mode: Returns mock orders from State
  */
-export async function fetchBlockchainOrders(userAddress: string): Promise<Order[]> {
+export async function fetchBlockchainOrders(): Promise<Order[]> {
   if (isMockMode()) {
     await delay(300);
     return MockState.getOrders();
@@ -57,22 +65,33 @@ export async function fetchBlockchainOrders(userAddress: string): Promise<Order[
   try {
     const client = getSuiClient();
     const marketId = env.sui.marketId;
-    
+
     if (!marketId) {
       console.warn("Market ID not configured");
       return [];
     }
 
-    // 1. Fetch Market object to get orders Table ID
+    // 1. Fetch Market object to get orders Table ID + generic type args
     const marketObj = await client.getObject({
       id: marketId,
-      options: { showContent: true },
+      options: { showContent: true, showType: true },
     });
 
     if (marketObj.data?.content?.dataType !== "moveObject") {
       console.warn("Invalid market object");
       return [];
     }
+
+    // Derive asset / collateral from Market<Asset, Collateral> type string.
+    let marketAsset = "USDC";
+    let marketCollateral = "SUI";
+    const marketType = marketObj.data.type || marketObj.data.content.type || "";
+    const generics = marketType.split("Market<")[1]?.split(">")[0]?.split(",");
+    if (generics && generics.length >= 2) {
+      marketAsset = symbolFromMoveType(generics[0].trim());
+      marketCollateral = symbolFromMoveType(generics[1].trim());
+    }
+    const assetDecimals = getDecimalsForAsset(marketAsset);
 
     const marketFields = marketObj.data.content.fields as any;
     // Market struct has 'orders' field which is a Table<ID, Order>
@@ -142,19 +161,30 @@ export async function fetchBlockchainOrders(userAddress: string): Promise<Order[
              }
         }
 
+        // Derive LTV from on-order prices when present, else leave undefined-ish at 0.
+        const collateralPrice = Number(fields.collateral_price || 0);
+        const assetPrice = Number(fields.asset_price || 0);
+        let derivedLtv = 0;
+        if (!fields.is_lend && collateralPrice > 0) {
+          // amount and (collateral implied via collateral_balances) live in raw smallest units;
+          // Order does not store collateral amount, so we approximate using asset/collateral price ratio.
+          derivedLtv = assetPrice > 0 ? assetPrice / collateralPrice : 0;
+        }
+
         return {
           id: orderId,
-          creator: fields.creator, // Add creator field to Order type if missing or use it for filtering
+          creator: fields.creator,
           type: fields.is_lend ? "lend" : "borrow",
-          asset: "USDC", // MVP hardcoded asset
-          amount: Number(fields.amount || 0) / 1_000_000, 
+          asset: marketAsset,
+          collateralAsset: marketCollateral,
+          amount: Number(fields.amount || 0) / Math.pow(10, assetDecimals),
           interestRate: Number(fields.interest_rate_bps || 0) / 100,
-          ltv: 0.7, // Order struct doesn't have LTV field! It's implied. Mocking 70% for display.
+          ltv: derivedLtv,
           term: Number(fields.duration_ms || 0) / (24 * 60 * 60 * 1000),
-          status: "pending", // All orders in table are pending/active
+          status: "pending",
           createdAt: new Date(Number(fields.created_at || 0)).toISOString(),
-          isHidden: false, // Table 'orders' is for public orders
-          fairnessScore: 85, // Mock score as it's not stored in Order struct
+          isHidden: false,
+          fairnessScore: 0,
           zkProofHash: undefined,
         } as Order;
       } catch (e) {
@@ -194,10 +224,19 @@ export async function fetchBlockchainPositions(userAddress: string): Promise<Pos
   try {
     const client = getSuiClient();
     const packageId = env.sui.packageId;
-    
+
     if (!packageId) {
       console.warn("Package ID not configured");
       return [];
+    }
+
+    // Live oracle prices for accurate LTV computation. Best-effort: failure -> empty map.
+    let priceMap: Record<string, number> = {};
+    try {
+      const priceData = await fetchBlockchainPrices();
+      priceMap = Object.fromEntries(priceData.map((p) => [p.asset, p.price]));
+    } catch (e) {
+      console.warn("Could not fetch oracle prices for LTV calc:", e);
     }
 
     // Loan is a generic type: Loan<Asset, Collateral>
@@ -221,7 +260,7 @@ export async function fetchBlockchainPositions(userAddress: string): Promise<Pos
         });
 
         for (const obj of objects.data) {
-           const pos = parseLoanObject(obj.data, userAddress, "lending");
+           const pos = parseLoanObject(obj.data, userAddress, "lending", priceMap);
            if (pos) allPositions.push(pos);
         }
       } catch (e) {
@@ -252,7 +291,7 @@ export async function fetchBlockchainPositions(userAddress: string): Promise<Pos
 
             for (const obj of loanObjects) {
                 if (obj.error) continue; // Skip deleted/error objects
-                const pos = parseLoanObject(obj.data, userAddress, "borrowing");
+                const pos = parseLoanObject(obj.data, userAddress, "borrowing", priceMap);
                 if (pos) {
                     allPositions.push(pos);
                 }
@@ -270,7 +309,12 @@ export async function fetchBlockchainPositions(userAddress: string): Promise<Pos
 }
 
 // Helper to parse Loan object into Position
-function parseLoanObject(data: any, userAddress: string, forceType?: "lending" | "borrowing"): Position | null {
+function parseLoanObject(
+  data: any,
+  userAddress: string,
+  forceType?: "lending" | "borrowing",
+  prices?: Record<string, number>,
+): Position | null {
     if (!data || data.content?.dataType !== "moveObject") return null;
 
     const content = data.content;
@@ -350,25 +394,45 @@ function parseLoanObject(data: any, userAddress: string, forceType?: "lending" |
     // Unique ID for React Key: Append type suffix to handle self-loans (Lender=Borrower)
     const uniqueId = `${data.objectId}-${type}`;
 
+    const amountHuman = amount / Math.pow(10, assetDecimals);
+    const collateralHuman = collateralRaw / Math.pow(10, collateralDecimals);
+
+    // LTV = debt value / collateral value, in percent.
+    // Use oracle prices if provided, otherwise fall back to a decimal-normalized ratio
+    // (still imperfect without prices but at least dimensionally consistent).
+    let ltv = 0;
+    if (collateralHuman > 0) {
+      const assetPrice = prices?.[asset] ?? 0;
+      const collateralPrice = prices?.[collateralAsset] ?? 0;
+      if (assetPrice > 0 && collateralPrice > 0) {
+        ltv = (amountHuman * assetPrice) / (collateralHuman * collateralPrice) * 100;
+      } else {
+        ltv = (amountHuman / collateralHuman) * 100;
+      }
+    }
+
+    // Liquidation price (collateral price at which the position would be liquidated)
+    // Approximated as debt_value / collateral_amount, scaled by a safety multiplier.
+    const liquidationPrice = type === "borrowing" && collateralHuman > 0
+      ? (amountHuman * 1.1) / collateralHuman
+      : undefined;
+
     return {
-        id: uniqueId, // Modified ID for uniqueness
+        id: uniqueId,
         type,
         asset,
-        amount: amount / Math.pow(10, assetDecimals),
+        amount: amountHuman,
         interestRate: interestRateBps / 100,
-        ltv: collateralRaw > 0 ? (amount / collateralRaw) * 100 : 0,
+        ltv,
         term: Math.floor(duration / (24 * 60 * 60 * 1000)),
         startDate: new Date(startTimestamp).toISOString(),
         endDate: new Date(startTimestamp + duration).toISOString(),
         earnedInterest: type === "lending" ? interestAccrued / Math.pow(10, assetDecimals) : 0,
         paidInterest: type === "borrowing" ? interestAccrued / Math.pow(10, assetDecimals) : 0,
         status,
-        collateralAsset: type === "borrowing" ? collateralAsset : undefined, // Only borrower cares about collateral details usually
-        collateralAmount: type === "borrowing" ? collateralRaw / Math.pow(10, collateralDecimals) : undefined,
-        liquidationPrice: type === "borrowing" && collateralRaw > 0 
-            ? (amount * 1.1) / collateralRaw 
-            : undefined,
-        // Add minimal collateral info for Lender too if needed
+        collateralAsset: type === "borrowing" ? collateralAsset : undefined,
+        collateralAmount: type === "borrowing" ? collateralHuman : undefined,
+        liquidationPrice,
     };
 }
 

@@ -21,6 +21,7 @@ import { executeCreateOrder, executeMatchOrders } from "@/lib/sui/transaction-ex
 import { calculateFairnessScore } from "@/lib/sui/blockchain-service";
 import { isMockMode, env } from "@/lib/config";
 import { formatNumber } from "@/lib/utils/format";
+import { pickBestMatch, type MatchCandidate } from "@/lib/matching/ranker";
 
 export default function OrderbookPage() {
   const { orders, user, isLoadingOrders, fetchOrders, addOrder, vestingPositions } = useAppStore();
@@ -31,6 +32,8 @@ export default function OrderbookPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isMatching, setIsMatching] = useState(false);
   const [lastTxDigest, setLastTxDigest] = useState<string | null>(null);
+  const [previewCandidate, setPreviewCandidate] = useState<MatchCandidate | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
 
   useEffect(() => {
     fetchOrders();
@@ -147,76 +150,67 @@ export default function OrderbookPage() {
     }
   };
 
-  const handleMatchOrders = async () => {
+  const handleFindMatch = () => {
     if (!address) return;
+
+    const { match, nearMissReason, consideredPairs } = pickBestMatch(orders, {
+      amountTolerance: 0.005,
+    });
+
+    if (!match) {
+      if (consideredPairs === 0) {
+        toast.info("Not enough open orders to match.");
+      } else {
+        toast.info(`No qualifying match across ${consideredPairs} pairs (${nearMissReason ?? "criteria mismatch"}).`);
+      }
+      return;
+    }
+
+    setPreviewCandidate(match);
+    setIsPreviewOpen(true);
+  };
+
+  const handleConfirmMatch = async () => {
+    if (!address || !previewCandidate) return;
+
     setIsMatching(true);
-    toast.loading("Finding matching orders...");
+    setIsPreviewOpen(false);
 
     try {
-      const pendingLends = orders.filter((o) => o.type === "lend" && o.status === "pending");
-      const pendingBorrows = orders.filter((o) => o.type === "borrow" && o.status === "pending");
+      const { lend, borrow } = previewCandidate;
 
-      if (pendingLends.length === 0 || pendingBorrows.length === 0) {
-        toast.dismiss();
-        toast.info("Not enough orders to match");
-        return;
-      }
-
-      let match = null;
-      // Simple logic: find first overlap where borrow rate >= lend rate AND amounts match exactly AND duration matches
-      // This is because current contract requires exact amount match (no partial fills)
-      for (const lend of pendingLends) {
-        for (const borrow of pendingBorrows) {
-          if (
-            lend.asset === borrow.asset && 
-            borrow.interestRate >= lend.interestRate &&
-            Math.abs(borrow.amount - lend.amount) < 0.001 && // Handle float precision
-            lend.term >= borrow.term // Lender duration must cover borrower duration
-          ) {
-            match = { lend, borrow };
-            break;
-          }
-        }
-        if (match) break;
-      }
-
-      if (!match) {
-        toast.dismiss();
-        toast.info("No matching price overlap found.");
-        return;
-      }
-
-      toast.dismiss();
-      toast.info("Match found! Computing AI fairness via Nautilus...");
-
-      // Check if borrower has vested positions for priority matching
-      const isVested = vestingPositions.some(vp => vp.status === "locked" || vp.status === "unlockable");
+      // Borrower-side vesting drives the priority boost — not the caller's positions.
+      const borrowerAddress = borrow.creator || address;
+      const isVested = borrowerAddress === address
+        ? vestingPositions.some((vp) => vp.status === "locked" || vp.status === "unlockable")
+        : false;
 
       const result = await executeMatchOrders(
-        match.lend.id,
-        match.borrow.id,
-        match.lend.asset,
+        lend.id,
+        borrow.id,
+        lend.asset,
         address,
         {
-          lendAmount: match.lend.amount,
-          borrowAmount: match.borrow.amount,
-          lendRate: match.lend.interestRate,
-          borrowRate: match.borrow.interestRate,
-          lenderAddress: match.lend.creator || address,
-          borrowerAddress: match.borrow.creator || address,
+          collateral: lend.collateralAsset || borrow.collateralAsset || "SUI",
+          lendAmount: lend.amount,
+          borrowAmount: borrow.amount,
+          lendRate: lend.interestRate,
+          borrowRate: borrow.interestRate,
+          lenderAddress: lend.creator || address,
+          borrowerAddress,
           isVested,
-        }
+        },
       );
 
       if (result.success) {
         setLastTxDigest(result.digest || null);
         toast.success(
           <div className="flex flex-col gap-1">
-            <span>Orders matched successfully!</span>
+            <span>Orders matched successfully.</span>
             {result.fairnessScore !== undefined && (
               <span className="text-xs text-emerald-400">
-                🤖 Nautilus AI Fairness: {result.fairnessScore}/100 
-                {result.finalRate !== undefined && ` • Rate: ${result.finalRate.toFixed(2)}%`}
+                Nautilus fairness {result.fairnessScore}/100
+                {result.finalRate !== undefined && ` • rate ${result.finalRate.toFixed(2)}%`}
               </span>
             )}
             {result.digest && (
@@ -226,37 +220,21 @@ export default function OrderbookPage() {
                 rel="noopener noreferrer"
                 className="text-xs text-blue-400 hover:underline flex items-center gap-1"
               >
-                {isMockMode() ? "View Tx" : "View transaction"} <ExternalLink className="w-3 h-3" />
+                {isMockMode() ? "View tx" : "View transaction"} <ExternalLink className="w-3 h-3" />
               </a>
             )}
-          </div>
+          </div>,
         );
-        // Wait a bit for indexing then refresh
         setTimeout(() => fetchOrders(), 2000);
       } else {
-        // Show fairness score even if matching failed (for demo)
-        if (result.fairnessScore !== undefined) {
-          toast.info(
-            <div className="flex flex-col gap-1">
-              <span className="text-amber-400">Match computed but not executed on-chain</span>
-              <span className="text-xs">
-                🤖 Fairness Score: {result.fairnessScore}/100
-                {result.finalRate !== undefined && ` • Computed Rate: ${result.finalRate.toFixed(2)}%`}
-              </span>
-              <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                {result.error}
-              </span>
-            </div>
-          );
-        } else {
-          toast.error(`Match failed: ${result.error}`);
-        }
+        toast.error(`Match failed: ${result.error}`);
       }
     } catch (error) {
       console.error("Match error:", error);
       toast.error("Failed to execute match");
     } finally {
       setIsMatching(false);
+      setPreviewCandidate(null);
     }
   };
 
@@ -277,9 +255,9 @@ export default function OrderbookPage() {
               </div>
               <div className="flex items-center gap-2">
                 {address && (
-                  <Button 
-                    variant="outline" 
-                    onClick={handleMatchOrders} 
+                  <Button
+                    variant="outline"
+                    onClick={handleFindMatch}
                     disabled={isMatching}
                     className="cursor-pointer border-[hsl(var(--primary))/20] text-[hsl(var(--primary))] hover:bg-[hsl(var(--primary))/10]"
                   >
@@ -494,6 +472,49 @@ export default function OrderbookPage() {
             </div>
           </div>
         </div>
+
+        <Dialog open={isPreviewOpen} onOpenChange={(open) => { setIsPreviewOpen(open); if (!open) setPreviewCandidate(null); }}>
+          <DialogContent className="sm:max-w-[520px] bg-[hsl(var(--card))] border-[hsl(var(--border))]">
+            <DialogHeader>
+              <DialogTitle className="text-[hsl(var(--foreground))]">Match Preview</DialogTitle>
+            </DialogHeader>
+            {previewCandidate && (
+              <div className="space-y-4 text-sm">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="rounded-lg border border-[hsl(var(--border))] p-3">
+                    <div className="text-xs text-[hsl(var(--muted-foreground))]">Lender</div>
+                    <div className="font-mono text-xs truncate">{previewCandidate.lend.creator || "—"}</div>
+                    <div className="mt-1">{formatNumber(previewCandidate.lend.amount)} {previewCandidate.lend.asset}</div>
+                    <div className="text-xs">@ {previewCandidate.lend.interestRate.toFixed(2)}% • {previewCandidate.lend.term}d</div>
+                  </div>
+                  <div className="rounded-lg border border-[hsl(var(--border))] p-3">
+                    <div className="text-xs text-[hsl(var(--muted-foreground))]">Borrower</div>
+                    <div className="font-mono text-xs truncate">{previewCandidate.borrow.creator || "—"}</div>
+                    <div className="mt-1">{formatNumber(previewCandidate.borrow.amount)} {previewCandidate.borrow.asset}</div>
+                    <div className="text-xs">@ {previewCandidate.borrow.interestRate.toFixed(2)}% • {previewCandidate.borrow.term}d</div>
+                  </div>
+                </div>
+                <div className="rounded-lg border border-[hsl(var(--border))] p-3 space-y-1">
+                  <div className="flex justify-between"><span>Composite score</span><span className="font-mono">{(previewCandidate.score * 100).toFixed(1)} / 100</span></div>
+                  <div className="flex justify-between text-xs text-[hsl(var(--muted-foreground))]"><span>Size fit</span><span>{(previewCandidate.breakdown.sizeFit * 100).toFixed(0)}%</span></div>
+                  <div className="flex justify-between text-xs text-[hsl(var(--muted-foreground))]"><span>Duration fit</span><span>{(previewCandidate.breakdown.durationFit * 100).toFixed(0)}%</span></div>
+                  <div className="flex justify-between text-xs text-[hsl(var(--muted-foreground))]"><span>Rate spread</span><span>{(previewCandidate.breakdown.rateGap * 100).toFixed(0)}%</span></div>
+                  <div className="flex justify-between text-xs text-[hsl(var(--muted-foreground))]"><span>Age priority</span><span>{(previewCandidate.breakdown.age * 100).toFixed(0)}%</span></div>
+                </div>
+                <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                  On-chain settlement signs the (lend, borrow, score) tuple via the registered Nautilus enclave.
+                  If the enclave call fails the match is aborted and you can retry.
+                </p>
+                <div className="flex gap-2 justify-end pt-2">
+                  <Button variant="outline" onClick={() => { setIsPreviewOpen(false); setPreviewCandidate(null); }} disabled={isMatching}>Cancel</Button>
+                  <Button onClick={handleConfirmMatch} disabled={isMatching}>
+                    {isMatching ? "Submitting..." : "Confirm Match"}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </DialogContent>
+        </Dialog>
       </main>
     </div>
   );

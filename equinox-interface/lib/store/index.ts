@@ -198,11 +198,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   fetchOrders: async () => {
-    const { walletAddress } = get();
     set({ isLoadingOrders: true });
 
     try {
-      const orders = await fetchBlockchainOrders(walletAddress || "");
+      const orders = await fetchBlockchainOrders();
       set({ orders, isLoadingOrders: false });
     } catch (error) {
       console.error("Failed to fetch orders:", error);

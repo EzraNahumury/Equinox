@@ -159,8 +159,10 @@ Keeper needs `DEPLOYER_MNEMONIC` (keeper wallet) and `STRATEGIST_SK` in `.env.lo
 ## Minimum-requirements checklist
 
 - ✅ **Integrates the DeepBook Predict contract on testnet** — `equinox_predict::vault` calls `predict::supply / mint / withdraw / redeem_permissionless` on the live package; deployed and linked.
-- ✅ **Works end-to-end** — deposit → signed supply/hedge legs → settle/redeem → withdraw, exercised by the `/predict` UI and `scripts/keeper.mts`. (Live funding needs testnet dUSDC from the form.)
+- ✅ **Works end-to-end** — deposit → signed supply/hedge legs → settle/redeem → withdraw, via the `/predict` UI and `scripts/keeper.mts`. Step-by-step test guide (both "use the live vault" and "publish your own") in **[DEMO.md](DEMO.md)**. Live funding needs testnet dUSDC from the form.
 - ✅ **Simulation result** — `SIMULATION.md` from real settled BTC history.
+
+See **[DEMO.md](DEMO.md)** to test the entire flow.
 
 ---
 

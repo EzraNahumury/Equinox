@@ -21,7 +21,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from "@mysten/sui/jsonRpc";
 
 import { predictConfig, toQuoteBase, fromQuoteBase, fromPriceScaled } from "../lib/predict/config";
-import { buildSupplyLegTx, buildHedgeLegTx, buildRedeemHedgeTx } from "../lib/predict/transactions";
+import { buildSupplyLegTx, buildHedgeLegTx, buildRedeemHedgeTx, buildVaultDepositTx } from "../lib/predict/transactions";
 import { buildSupplyMessage, buildHedgeMessage, strategistKeypair, signLeg } from "../lib/predict/strategist";
 import { fetchActiveOracles, fetchPricesLatest } from "../lib/predict/server";
 
@@ -158,16 +158,59 @@ async function allocate(supplyDusdc: number, hedgeDusdc: number) {
   );
 }
 
-async function main() {
-  const cmd = process.argv[2] || "status";
-  if (cmd === "status") return status();
-  if (cmd === "allocate") return allocate(Number(process.argv[3] || 0), Number(process.argv[4] || 0));
-  if (cmd === "redeem") {
-    console.log("redeem: provide oracle/expiry/strike of a settled hedge to redeem.");
-    console.log("Use buildRedeemHedgeTx(...) once the target hedge is identified from /managers/:id/positions/summary.");
-    return;
+async function deposit(amountDusdc: number) {
+  if (!(amountDusdc > 0)) {
+    console.error("usage: keeper.mts deposit <dUSDC amount>");
+    process.exit(1);
   }
-  console.log("usage: keeper.mts [status|allocate <supplyDusdc> <hedgeDusdc>|redeem]");
+  const kp = keeper();
+  const addr = kp.toSuiAddress();
+  const coins = await client.getCoins({ owner: addr, coinType: predictConfig.dusdcType });
+  if (coins.data.length === 0) {
+    console.error("Keeper wallet holds no dUSDC. Request it: https://tally.so/r/Xx102L");
+    process.exit(1);
+  }
+  const top = coins.data.sort((a, b) => Number(b.balance) - Number(a.balance))[0];
+  const tx = buildVaultDepositTx(top.coinObjectId, toQuoteBase(amountDusdc));
+  await exec(tx, `deposit ${amountDusdc} dUSDC -> vault (mints VAULT_SHARE)`);
+}
+
+async function redeem(oracleId: string, expiry: string, strike: string, isUp: string, qtyDusdc: string) {
+  if (!oracleId || !expiry || !strike) {
+    console.error("usage: keeper.mts redeem <oracleId> <expiryMs> <strikeScaled> <isUp 0|1> <quantityDusdc>");
+    console.error("Find settled hedge params via /managers/" + predictConfig.managerId + "/positions/summary");
+    process.exit(1);
+  }
+  const tx = buildRedeemHedgeTx({
+    oracleId,
+    expiry: BigInt(expiry),
+    strike: BigInt(strike),
+    isUp: isUp === "1" || isUp === "true",
+    quantity: toQuoteBase(Number(qtyDusdc || 1)),
+  });
+  await exec(tx, `redeem hedge on ${oracleId.slice(0, 10)}`);
+}
+
+async function demo(totalDusdc: number) {
+  const total = totalDusdc > 0 ? totalDusdc : 10;
+  console.log(`\n== full end-to-end demo with ${total} dUSDC ==`);
+  await deposit(total);
+  await new Promise((r) => setTimeout(r, 2000));
+  // 80% supply, 2 dUSDC hedge budget.
+  await allocate(Math.floor(total * 0.8), Math.min(2, Math.max(1, Math.floor(total * 0.1))));
+  console.log("\nDemo complete. Check status:");
+  await status();
+}
+
+async function main() {
+  const a = process.argv;
+  const cmd = a[2] || "status";
+  if (cmd === "status") return status();
+  if (cmd === "deposit") return deposit(Number(a[3] || 0));
+  if (cmd === "allocate") return allocate(Number(a[3] || 0), Number(a[4] || 0));
+  if (cmd === "redeem") return redeem(a[3], a[4], a[5], a[6], a[7]);
+  if (cmd === "demo") return demo(Number(a[3] || 0));
+  console.log("usage: keeper.mts [status | deposit <dUSDC> | allocate <supply> <hedge> | redeem <oracle> <expiry> <strike> <isUp> <qty> | demo <total>]");
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

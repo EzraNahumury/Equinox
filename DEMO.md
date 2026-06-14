@@ -95,7 +95,7 @@ viewable at `https://suiscan.xyz/testnet/tx/<digest>`. Final vault state confirm
 | deposit — 10 dUSDC → 10 VAULT_SHARE | `26YYNBhK3qrupgxy88QmUUU6N1AAH8Y8BmTNMvQG4QPz` | ✅ success |
 | supply leg — 8 dUSDC → Predict PLP | `CCAVmHVDn8xEjHzwVJcaCZTdXvDagxvtkxQ9ujgrgDFT` | ✅ success |
 | hedge mint — BTC down-binary, 1 dUSDC budget | `E6Xdw51ZVRtAp9H4XnsX2ASxyHmsduGWnYB98JdQriRb` | ✅ success |
-| redeem (settled) | reproducible after expiry — see below | ⏳ pending settlement |
+| redeem — settled & closed on-chain | `9tsAHnK6Er9qPR15jReujozpGLtRSr5p7yqAeJAgrdzr` | ✅ success |
 
 > **Hedge strike note.** On testnet the Predict PLP only quotes mintable asks within ~±0.5% of
 > spot, so the demo hedge is a 0.5%-OTM BTC down-binary; `assert_mintable_ask` rejects deeper
@@ -103,10 +103,11 @@ viewable at `https://suiscan.xyz/testnet/tx/<digest>`. Final vault state confirm
 > on-chain mechanism (strategist-signed leg → `predict::mint` via the keeper-owned manager) is
 > identical at any strike.
 
-Redeem runs once oracle `0x66cad881da8fc165bf71915e644849c4a5c4e02022e3f393c22f7c0372f8fbfa`
-settles at its expiry (`1781418600000`):
-
-```bash
-npx tsx scripts/keeper.mts redeem \
-  0x66cad881da8fc165bf71915e644849c4a5c4e02022e3f393c22f7c0372f8fbfa 1781418600000 63960000000000 0 0.1
-```
+**Settlement & redeem.** Oracle `0x66cad881…` settled at **$64,328** (`settlement_price
+64328025031967`) — above the $63,960 strike, so the down-binary expired worthless: payout 0,
+premium −0.005426 dUSDC. That is the hedge behaving exactly as designed: a small carry cost
+when no crash occurs (it would have paid $1/contract on a deep down-move). The settled position
+was closed on-chain via `predict::redeem_permissionless` — permissionless by design, so any
+keeper can settle it (here tx `9tsAHnK6Er9qPR15jReujozpGLtRSr5p7yqAeJAgrdzr`, redeemer
+`0x49c56c…`). The vault's own `execute_redeem_hedge` sweep is a no-op once a position has already
+been permissionlessly redeemed; on a winning hedge it sweeps the payout back into vault idle.

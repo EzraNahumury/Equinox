@@ -210,6 +210,10 @@ async function hedge(hedgeDusdc: number, otmPct = 2, qtyContracts = 0.5) {
   const tick = oracle.tick_size;
   const strike = Math.floor((spotScaled * (1 - otmPct / 100)) / tick) * tick; // OTM down, snapped to tick
   const budgetBase = hedgeDusdc > 0 ? toQuoteBase(hedgeDusdc) : (v.idle * BigInt(2)) / BigInt(100);
+  if (budgetBase <= BigInt(0) || budgetBase > v.idle) {
+    console.log(`hedge: skip — budget ${fromQuoteBase(budgetBase)} > idle ${fromQuoteBase(v.idle)} dUSDC`);
+    return;
+  }
   const quantity = toQuoteBase(qtyContracts);
   const nonce = BigInt(Date.now());
   const strat = strategistKeypair(STRATEGIST_SK);

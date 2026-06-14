@@ -1,0 +1,38 @@
+name: Vortex keeper — settled-redeem
+
+# Unattended settled-redeem keeper (idea-bank #8): every 30 min it scans the
+# vault's hedge positions and redeems any that have settled, sweeping the payout
+# back into the vault. Keeper keys live in repo Secrets — never in the frontend.
+#
+# Required repo secret:  DEPLOYER_MNEMONIC  (keeper wallet that owns the PredictManager)
+# Optional repo secret:  STRATEGIST_SK      (defaults to the dev strategist key in keeper.mts)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"      # every 30 minutes (UTC)
+  workflow_dispatch: {}          # allow manual runs from the Actions tab
+
+concurrency:
+  group: vortex-keeper
+  cancel-in-progress: false
+
+jobs:
+  redeem:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vortex-interface
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: npm ci
+      - name: Status + redeem settled hedges
+        env:
+          DEPLOYER_MNEMONIC: ${{ secrets.DEPLOYER_MNEMONIC }}
+          STRATEGIST_SK: ${{ secrets.STRATEGIST_SK }}
+        run: |
+          npx tsx scripts/keeper.mts status
+          npx tsx scripts/keeper.mts redeem-settled

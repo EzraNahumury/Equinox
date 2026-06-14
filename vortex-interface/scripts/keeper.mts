@@ -26,7 +26,7 @@ import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from "@mysten/sui/jsonRpc";
 import { predictConfig, toQuoteBase, fromQuoteBase, fromPriceScaled } from "../lib/predict/config";
 import { buildSupplyLegTx, buildHedgeLegTx, buildWithdrawPlpLegTx, buildRedeemHedgeTx, buildVaultDepositTx } from "../lib/predict/transactions";
 import { buildSupplyMessage, buildHedgeMessage, buildWithdrawPlpMessage, strategistKeypair, signLeg } from "../lib/predict/strategist";
-import { fetchActiveOracles, fetchPricesLatest } from "../lib/predict/server";
+import { fetchActiveOracles, fetchPricesLatest, fetchManagerPositions } from "../lib/predict/server";
 
 function loadEnv(): Record<string, string> {
   try {
@@ -286,6 +286,35 @@ async function redeem(oracleId: string, expiry: string, strike: string, isUp: st
   await unwind(0);
 }
 
+/** Auto-scan the keeper's manager positions and redeem every settled-but-open hedge (cron-safe). */
+async function redeemSettled() {
+  const raw = await fetchManagerPositions(predictConfig.managerId);
+  const list = (Array.isArray(raw) ? raw : []) as Array<{
+    oracle_id: string; expiry: number; strike: number; is_up: boolean; open_quantity: number; underlying_asset?: string;
+  }>;
+  const now = Date.now();
+  const settled = list.filter((p) => Number(p.open_quantity) > 0 && Number(p.expiry) < now);
+  if (settled.length === 0) {
+    console.log("redeem-settled: no settled open hedges");
+    return;
+  }
+  console.log(`redeem-settled: ${settled.length} settled position(s) to redeem`);
+  for (const p of settled) {
+    try {
+      const tx = buildRedeemHedgeTx({
+        oracleId: p.oracle_id,
+        expiry: BigInt(p.expiry),
+        strike: BigInt(p.strike),
+        isUp: p.is_up,
+        quantity: BigInt(p.open_quantity),
+      });
+      await exec(tx, `redeem ${p.underlying_asset ?? "BTC"} @ ${p.strike}`);
+    } catch (e) {
+      console.log(`  skip ${p.strike}: ${e instanceof Error ? e.message.slice(0, 80) : String(e)}`);
+    }
+  }
+}
+
 async function demo(totalDusdc: number) {
   const total = totalDusdc > 0 ? totalDusdc : 10;
   console.log(`\n== full end-to-end demo with ${total} dUSDC ==`);
@@ -307,8 +336,9 @@ async function main() {
   if (cmd === "hedge") return hedge(Number(a[3] || 0), a[4] ? Number(a[4]) : 2, a[5] ? Number(a[5]) : 0.5);
   if (cmd === "unwind") return unwind(Number(a[3] || 0));
   if (cmd === "redeem") return redeem(a[3], a[4], a[5], a[6], a[7]);
+  if (cmd === "redeem-settled") return redeemSettled();
   if (cmd === "demo") return demo(Number(a[3] || 0));
-  console.log("usage: keeper.mts [status | deposit <dUSDC> | allocate <supply> <hedge> | hedge [budget] | unwind [plp] | redeem <oracle> <expiry> <strike> <isUp> <qty> | demo <total>]");
+  console.log("usage: keeper.mts [status | deposit <dUSDC> | allocate <supply> <hedge> | supply <dUSDC> | hedge [budget] [otmPct] [qty] | unwind [plp] | redeem <oracle> <expiry> <strike> <isUp> <qty> | redeem-settled | demo <total>]");
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

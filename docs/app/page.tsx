@@ -62,7 +62,16 @@ export default function DocsPage() {
     s.type = "module";
     s.textContent =
       "import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';" +
-      "mermaid.initialize({ startOnLoad: false, theme: 'neutral', fontFamily: 'inherit' });" +
+      "mermaid.initialize({ startOnLoad: false, theme: 'dark', fontFamily: 'inherit', themeVariables: {" +
+      "  background: '#0f1714', lineColor: '#ffffff', textColor: '#ffffff'," +
+      "  mainBkg: '#16221d', primaryColor: '#16221d', primaryTextColor: '#ffffff', primaryBorderColor: '#46584f'," +
+      "  secondaryColor: '#1b2a24', tertiaryColor: '#16221d', edgeLabelBackground: '#0f1714'," +
+      "  clusterBkg: '#16221d', clusterBorder: '#46584f'," +
+      "  actorBkg: '#16221d', actorBorder: '#46584f', actorTextColor: '#ffffff', actorLineColor: '#9fb0a8'," +
+      "  signalColor: '#ffffff', signalTextColor: '#ffffff'," +
+      "  labelBoxBkgColor: '#16221d', labelBoxBorderColor: '#46584f', labelTextColor: '#ffffff'," +
+      "  noteBkgColor: '#2a3a32', noteTextColor: '#ffffff', noteBorderColor: '#46584f'" +
+      "} });" +
       "mermaid.run({ querySelector: '.mermaid' });";
     document.body.appendChild(s);
     return () => { document.body.removeChild(s); };
@@ -238,13 +247,14 @@ npm run dev      # http://localhost:3000  ->  Connect Wallet  ->  /predict`}</Co
           <section id="lifecycle" className="scroll-mt-24">
             <H2>Vault lifecycle</H2>
             <pre className="mermaid">{`stateDiagram-v2
-    [*] --> Idle: deposit(dUSDC) - mint VAULT_SHARE
-    Idle --> Deployed: execute_supply_leg / execute_hedge_leg
-    Deployed --> Deployed: oracle rolls - fresh legs
+    direction LR
+    [*] --> Idle: deposit · mint share
+    Idle --> Deployed: supply + hedge legs
+    Deployed --> Deployed: oracle rolls
     Deployed --> Settled: oracle settles
-    Settled --> Idle: execute_redeem_hedge - sweep payout
-    Deployed --> Idle: execute_withdraw_plp_leg - unwind
-    Idle --> [*]: withdraw - burn VAULT_SHARE`}</pre>
+    Settled --> Idle: redeem · sweep
+    Deployed --> Idle: withdraw_plp · unwind
+    Idle --> [*]: withdraw · burn share`}</pre>
           </section>
 
           {/* VERIFIABLE */}
